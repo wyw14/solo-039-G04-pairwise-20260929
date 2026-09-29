@@ -22,6 +22,19 @@ type leaseRequest struct {
 	Owner  string  `json:"owner"`
 	Amount float64 `json:"amount"`
 }
+type meterReadingRequest struct {
+	Meter      string  `json:"meter"`
+	Utility    string  `json:"utility"`
+	Value      float64 `json:"value"`
+	Unit       string  `json:"unit"`
+	At         int64   `json:"at"`
+	RolloverAt float64 `json:"rollover_at"`
+}
+type productOutputRequest struct {
+	BatchID string  `json:"batch_id"`
+	Amount  float64 `json:"amount"`
+	Unit    string  `json:"unit"`
+}
 
 func decodeJSON(r *http.Request, value any) error {
 	decoder := json.NewDecoder(r.Body)

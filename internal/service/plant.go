@@ -8,6 +8,7 @@ import (
 	"github.com/wyw14/solo-039/internal/analyzer"
 	"github.com/wyw14/solo-039/internal/campaign"
 	"github.com/wyw14/solo-039/internal/column"
+	"github.com/wyw14/solo-039/internal/energy"
 	"github.com/wyw14/solo-039/internal/feed"
 	"github.com/wyw14/solo-039/internal/interlock"
 	"github.com/wyw14/solo-039/internal/journal"
@@ -52,6 +53,7 @@ type Plant struct {
 	Evidence          *analyzer.EvidenceCatalog
 	ReliefHistory     *relief.History
 	Incidents         *Incidents
+	Energy            *energy.Recorder
 	started           bool
 	lastError         string
 }
@@ -90,6 +92,7 @@ func NewPlant(dataDir string) *Plant {
 		Evidence:          analyzer.NewEvidenceCatalog(),
 		ReliefHistory:     relief.NewHistory(),
 		Incidents:         NewIncidents(),
+		Energy:            energy.NewRecorder(filepath.Join(dataDir, "energy.jsonl")),
 	}
 	plant.Reflux.Register("T-101", plant.RefluxState)
 	plant.Feed.Observe = plant.observeFeed
@@ -117,6 +120,13 @@ func (p *Plant) Start(ctx context.Context, grade, source string) (model.Campaign
 	current.Grade = grade
 	campaign.Restore(p.Campaign, current)
 	p.CampaignHistory.Record(before, current, "start grade selected")
+	batchCampaign := p.Campaign.Snapshot()
+	batchCampaign.Phase = model.Preparing
+	if _, err := p.Energy.Begin(batchCampaign, time.Now().Unix()); err != nil {
+		operationErr = err
+		p.fail(err)
+		return model.Campaign{}, err
+	}
 	if err := p.Feed.Switch(ctx, source, current); err != nil {
 		operationErr = err
 		p.fail(err)
@@ -124,13 +134,15 @@ func (p *Plant) Start(ctx context.Context, grade, source string) (model.Campaign
 	}
 	p.Column.SetFeedRevision(p.Feed.Current.Revision)
 	p.Analyzer.BindFeed(p.Feed.Current.Revision)
-	p.Campaign.Advance(model.Warming)
+	warming := p.Campaign.Advance(model.Warming)
+	_ = p.Energy.Phase(warming, time.Now().Unix())
 	if err := p.Reboiler.Ramp(ctx, p.Campaign.Snapshot(), 0.5); err != nil {
 		operationErr = err
 		p.fail(err)
 		return model.Campaign{}, err
 	}
-	p.Campaign.Advance(model.Stabilizing)
+	stabilizing := p.Campaign.Advance(model.Stabilizing)
+	_ = p.Energy.Phase(stabilizing, time.Now().Unix())
 	p.Column.Apply(p.Campaign.Snapshot(), 1.1, 0.5)
 	_ = p.Profile.Put(column.TrayReading{Tray: 1, Temperature: 118, Pressure: 1.1})
 	_ = p.Profile.Put(column.TrayReading{Tray: 20, Temperature: 82, Pressure: 0.9})
@@ -149,6 +161,7 @@ func (p *Plant) Transition(ctx context.Context, grade, source string) (model.Cam
 	}
 	before := p.Campaign.Snapshot()
 	current := p.Campaign.Advance(model.Transitioning)
+	_ = p.Energy.Phase(current, time.Now().Unix())
 	current.Grade = grade
 	current.Revision = uuid.New()
 	campaign.Restore(p.Campaign, current)
@@ -197,6 +210,7 @@ func (p *Plant) RouteProduct(target string) error {
 	}
 	current.Phase = model.OnSpec
 	campaign.Restore(p.Campaign, current)
+	_ = p.Energy.Phase(current, time.Now().Unix())
 	plan := model.ProductPlan{Campaign: current.ID, Revision: current.Revision, Grade: current.Grade, Target: target}
 	if err := p.Product.PublishWithProof(plan, proof); err != nil {
 		p.ProductAudit.Record(plan, proof, false, err.Error())
@@ -226,6 +240,7 @@ func (p *Plant) AcquireReflux(owner string, amount float64) (model.Lease, error)
 
 func (p *Plant) Shutdown(ctx context.Context, reliefTimeout bool) (relief.ShutdownResult, error) {
 	current := p.Campaign.Advance(model.Shutting)
+	_ = p.Energy.Phase(current, time.Now().Unix())
 	reliefErr := p.Relief.Shutdown(ctx, current, "flare", reliefTimeout)
 	steamErr := p.ReboilerCommands.Close(ctx, p.Reboiler, current)
 	p.ReboilerTelemetry.Record(p.Reboiler.Snapshot())
@@ -237,6 +252,11 @@ func (p *Plant) Shutdown(ctx context.Context, reliefTimeout bool) (relief.Shutdo
 		return result, err
 	}
 	p.Campaign.Stop()
+	stopped := p.Campaign.Snapshot()
+	if _, err := p.Energy.End(stopped, time.Now().Unix()); err != nil {
+		p.fail(err)
+		return result, err
+	}
 	p.mu.Lock()
 	p.started = false
 	p.mu.Unlock()
@@ -262,6 +282,18 @@ func (p *Plant) Restore() error {
 	if err := journal.ValidateRecovery(snapshot, p.Journal.Events()); err != nil {
 		return err
 	}
+	if err := p.Energy.Load(); err != nil {
+		return err
+	}
+	// A crash between campaign stop and the journaled batch close would leave
+	// a dangling open account; close it now using the snapshot time.
+	if snapshot.Campaign.Phase == model.Stopped {
+		if _, open := p.Energy.Accountant.CurrentBatchID(); open {
+			if _, err := p.Energy.End(snapshot.Campaign, time.Now().Unix()); err != nil {
+				return err
+			}
+		}
+	}
 	p.mu.Lock()
 	p.started = snapshot.Campaign.Phase != model.Stopped
 	p.mu.Unlock()
@@ -284,7 +316,8 @@ func (p *Plant) Status() map[string]any {
 	lastError := p.lastError
 	p.mu.RUnlock()
 	gradient, _ := p.Profile.Gradient()
-	return map[string]any{"started": started, "last_error": lastError, "campaign": p.Campaign.Snapshot(), "column": p.Column.Snapshot(), "reflux_used": p.Reflux.Used(), "products": p.ProductTargets(), "relief": p.Relief.State.Snapshot(), "feed_metrics": p.FeedMetrics.Snapshot(), "reflux_telemetry": p.RefluxTelemetry.Snapshot(), "reboiler_telemetry": p.ReboilerTelemetry.Snapshot(), "product_decisions": p.ProductAudit.Count(), "utility_used": p.UtilityLedger.Used(), "metrics": p.Metrics.Snapshot(), "campaign_changes": p.CampaignHistory.Count(), "profile_gradient": gradient, "profile_stable": p.Profile.Stable(40), "evidence_count": p.Evidence.Count(p.Campaign.Snapshot().Revision.String()), "relief_attempts": p.ReliefHistory.Count(), "open_incidents": p.Incidents.CountOpen(), "operational_audit": p.OperationalAudit()}
+	energyCurrent, energyOpen := p.EnergyCurrent()
+	return map[string]any{"started": started, "last_error": lastError, "campaign": p.Campaign.Snapshot(), "column": p.Column.Snapshot(), "reflux_used": p.Reflux.Used(), "products": p.ProductTargets(), "relief": p.Relief.State.Snapshot(), "feed_metrics": p.FeedMetrics.Snapshot(), "reflux_telemetry": p.RefluxTelemetry.Snapshot(), "reboiler_telemetry": p.ReboilerTelemetry.Snapshot(), "product_decisions": p.ProductAudit.Count(), "utility_used": p.UtilityLedger.Used(), "metrics": p.Metrics.Snapshot(), "campaign_changes": p.CampaignHistory.Count(), "profile_gradient": gradient, "profile_stable": p.Profile.Stable(40), "evidence_count": p.Evidence.Count(p.Campaign.Snapshot().Revision.String()), "relief_attempts": p.ReliefHistory.Count(), "open_incidents": p.Incidents.CountOpen(), "energy_current_open": energyOpen, "energy_current": energyCurrent, "energy": p.EnergySummary(), "operational_audit": p.OperationalAudit()}
 }
 
 func (p *Plant) record(kind, payload string) error {

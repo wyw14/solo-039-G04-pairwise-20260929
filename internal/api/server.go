@@ -12,9 +12,13 @@ type Server struct {
 	router  chi.Router
 }
 
-func NewServer() *Server {
-	plant := service.NewPlant("data")
+func NewServer() *Server { return NewServerAt("data") }
+
+// NewServerAt builds a server backed by the given data directory.
+func NewServerAt(dataDir string) *Server {
+	plant := service.NewPlant(dataDir)
 	_ = plant.Restore()
+	plant.LoadEnergy()
 	s := &Server{runtime: service.NewRuntime("baseline"), plant: plant, router: chi.NewRouter()}
 	s.routes()
 	return s
