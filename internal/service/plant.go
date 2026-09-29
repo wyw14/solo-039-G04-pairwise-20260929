@@ -8,6 +8,7 @@ import (
 	"github.com/wyw14/solo-039/internal/analyzer"
 	"github.com/wyw14/solo-039/internal/campaign"
 	"github.com/wyw14/solo-039/internal/column"
+	"github.com/wyw14/solo-039/internal/energy"
 	"github.com/wyw14/solo-039/internal/feed"
 	"github.com/wyw14/solo-039/internal/interlock"
 	"github.com/wyw14/solo-039/internal/journal"
@@ -44,6 +45,8 @@ type Plant struct {
 	ReboilerTelemetry *reboiler.Telemetry
 	ProductAudit      *product.Audit
 	UtilityLedger     *utility.Ledger
+	EnergyLedger      *energy.Ledger
+	EnergyStore       *energy.FileStore
 	Metrics           *Metrics
 	CampaignHistory   *campaign.History
 	Profile           *column.Profile
@@ -61,6 +64,12 @@ func NewPlant(dataDir string) *Plant {
 	analyzerState := analyzer.New()
 	store := journal.New()
 	refluxCoordinator := reflux.NewCoordinator(1)
+	energyStore := energy.NewFileStore(filepath.Join(dataDir, "energy.jsonl"))
+	energyLedger := energy.NewLedger()
+	if events, err := energyStore.Read(); err == nil {
+		_ = energy.Replay(energyLedger, events)
+	}
+	energyLedger.WithSink(energyStore)
 	plant := &Plant{
 		Campaign:          campaignState,
 		Column:            column.New("T-101"),
@@ -82,6 +91,8 @@ func NewPlant(dataDir string) *Plant {
 		ReboilerTelemetry: reboiler.NewTelemetry(),
 		ProductAudit:      product.NewAudit(),
 		UtilityLedger:     utility.NewLedger(),
+		EnergyLedger:      energyLedger,
+		EnergyStore:       energyStore,
 		Metrics:           NewMetrics(),
 		CampaignHistory:   campaign.NewHistory(),
 		Profile:           column.NewProfile(),
@@ -124,13 +135,17 @@ func (p *Plant) Start(ctx context.Context, grade, source string) (model.Campaign
 	}
 	p.Column.SetFeedRevision(p.Feed.Current.Revision)
 	p.Analyzer.BindFeed(p.Feed.Current.Revision)
+	p.beginEnergyRun(p.Campaign.Snapshot())
 	p.Campaign.Advance(model.Warming)
+	p.advanceEnergyPhase(model.Warming)
 	if err := p.Reboiler.Ramp(ctx, p.Campaign.Snapshot(), 0.5); err != nil {
 		operationErr = err
 		p.fail(err)
+		_ = p.EnergyLedger.EndBatch(time.Now().UnixNano())
 		return model.Campaign{}, err
 	}
 	p.Campaign.Advance(model.Stabilizing)
+	p.advanceEnergyPhase(model.Stabilizing)
 	p.Column.Apply(p.Campaign.Snapshot(), 1.1, 0.5)
 	_ = p.Profile.Put(column.TrayReading{Tray: 1, Temperature: 118, Pressure: 1.1})
 	_ = p.Profile.Put(column.TrayReading{Tray: 20, Temperature: 82, Pressure: 0.9})
@@ -164,6 +179,7 @@ func (p *Plant) Transition(ctx context.Context, grade, source string) (model.Cam
 		p.fail(err)
 		return model.Campaign{}, err
 	}
+	p.advanceEnergyPhase(model.Transitioning)
 	return p.Campaign.Snapshot(), nil
 }
 
@@ -204,6 +220,7 @@ func (p *Plant) RouteProduct(target string) error {
 		return err
 	}
 	p.ProductAudit.Record(plan, proof, true, "durable proof accepted")
+	p.advanceEnergyPhase(model.OnSpec)
 	return p.record("product.routed", target)
 }
 
@@ -226,6 +243,7 @@ func (p *Plant) AcquireReflux(owner string, amount float64) (model.Lease, error)
 
 func (p *Plant) Shutdown(ctx context.Context, reliefTimeout bool) (relief.ShutdownResult, error) {
 	current := p.Campaign.Advance(model.Shutting)
+	p.advanceEnergyPhase(model.Shutting)
 	reliefErr := p.Relief.Shutdown(ctx, current, "flare", reliefTimeout)
 	steamErr := p.ReboilerCommands.Close(ctx, p.Reboiler, current)
 	p.ReboilerTelemetry.Record(p.Reboiler.Snapshot())
@@ -240,7 +258,12 @@ func (p *Plant) Shutdown(ctx context.Context, reliefTimeout bool) (relief.Shutdo
 	p.mu.Lock()
 	p.started = false
 	p.mu.Unlock()
-	return result, p.record("plant.stopped", "safe")
+	if err := p.record("plant.stopped", "safe"); err != nil {
+		return result, err
+	}
+	// 批次在此封口：此后抄到的蒸汽/冷却水用量归入停机未分摊，不会落到下一批。
+	p.endEnergyRun()
+	return result, nil
 }
 
 func (p *Plant) Snapshot() model.Snapshot {
@@ -268,6 +291,17 @@ func (p *Plant) Restore() error {
 	if !model.PhaseAllowsHeat(snapshot.Campaign.Phase) {
 		p.Reboiler.Stop()
 	}
+	// 崩溃恢复：快照已停车但能源批次未封口时，按停车事件时间补封口，
+	// 避免停机后的抄表用量被算进上一批，同时解除对下一批开批的阻塞。
+	if snapshot.Campaign.Phase == model.Stopped && p.EnergyLedger.OpenBatchID() != "" {
+		closedAt := time.Now().UnixNano()
+		if latest, ok := journal.Latest(p.Journal.Events()); ok && latest.At > 0 {
+			closedAt = latest.At
+		}
+		if err := p.EnergyLedger.EndBatch(closedAt); err != nil {
+			return err
+		}
+	}
 	return nil
 }
 
@@ -284,7 +318,19 @@ func (p *Plant) Status() map[string]any {
 	lastError := p.lastError
 	p.mu.RUnlock()
 	gradient, _ := p.Profile.Gradient()
-	return map[string]any{"started": started, "last_error": lastError, "campaign": p.Campaign.Snapshot(), "column": p.Column.Snapshot(), "reflux_used": p.Reflux.Used(), "products": p.ProductTargets(), "relief": p.Relief.State.Snapshot(), "feed_metrics": p.FeedMetrics.Snapshot(), "reflux_telemetry": p.RefluxTelemetry.Snapshot(), "reboiler_telemetry": p.ReboilerTelemetry.Snapshot(), "product_decisions": p.ProductAudit.Count(), "utility_used": p.UtilityLedger.Used(), "metrics": p.Metrics.Snapshot(), "campaign_changes": p.CampaignHistory.Count(), "profile_gradient": gradient, "profile_stable": p.Profile.Stable(40), "evidence_count": p.Evidence.Count(p.Campaign.Snapshot().Revision.String()), "relief_attempts": p.ReliefHistory.Count(), "open_incidents": p.Incidents.CountOpen(), "operational_audit": p.OperationalAudit()}
+	return map[string]any{"started": started, "last_error": lastError, "campaign": p.Campaign.Snapshot(), "column": p.Column.Snapshot(), "reflux_used": p.Reflux.Used(), "products": p.ProductTargets(), "relief": p.Relief.State.Snapshot(), "feed_metrics": p.FeedMetrics.Snapshot(), "reflux_telemetry": p.RefluxTelemetry.Snapshot(), "reboiler_telemetry": p.ReboilerTelemetry.Snapshot(), "product_decisions": p.ProductAudit.Count(), "utility_used": p.UtilityLedger.Used(), "energy": p.energySummary(), "metrics": p.Metrics.Snapshot(), "campaign_changes": p.CampaignHistory.Count(), "profile_gradient": gradient, "profile_stable": p.Profile.Stable(40), "evidence_count": p.Evidence.Count(p.Campaign.Snapshot().Revision.String()), "relief_attempts": p.ReliefHistory.Count(), "open_incidents": p.Incidents.CountOpen(), "operational_audit": p.OperationalAudit()}
+}
+
+// energySummary 汇总当前批次能源核算结果供状态接口使用。
+func (p *Plant) energySummary() map[string]any {
+	accounts := p.EnergyLedger.Accounts()
+	var current *energy.BatchAccount
+	for i := range accounts.Batches {
+		if accounts.Batches[i].BatchID == p.EnergyLedger.OpenBatchID() {
+			current = &accounts.Batches[i]
+		}
+	}
+	return map[string]any{"open_batch": p.EnergyLedger.OpenBatchID(), "unassigned": accounts.Unassigned, "meters": len(accounts.Meters), "batches": len(accounts.Batches), "current": current}
 }
 
 func (p *Plant) record(kind, payload string) error {
